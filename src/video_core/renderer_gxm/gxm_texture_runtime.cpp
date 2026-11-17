@@ -617,7 +617,7 @@ void TextureRuntime::Sync(Surface* a, Surface* b, const char* why) {
     // A deferred depth clear must be in memory before anything touches the memory.
     for (Surface* s : {a, b}) {
         if (s != nullptr && s->HasPendingClear()) {
-            FlushPendingClear(*s);
+            FlushPendingClear(*s, "clear: pending flushed by a sync");
         }
     }
     // Naming no surface at all means "wait for everything"; naming one and leaving the other
@@ -657,7 +657,19 @@ void TextureRuntime::Sync(Surface* a, Surface* b, const char* why) {
                          unconditional ? " (unconditional)" : "");
             }
         }
+        static const bool time_syncs = GxmFlag("timedraw");
+        const u64 start_us = time_syncs ? Common::PipelineStats::NowUs() : 0;
         sync_hook(serial);
+        const u64 took_us = time_syncs ? Common::PipelineStats::NowUs() - start_us : 0;
+        const char* reason = why != nullptr ? why : "?";
+        auto it = std::find_if(sync_reasons.begin(), sync_reasons.end(),
+                               [&](const SyncReason& r) { return std::strcmp(r.why, reason) == 0; });
+        if (it == sync_reasons.end()) {
+            sync_reasons.push_back({reason, 1, took_us});
+        } else {
+            it->count++;
+            it->us += took_us;
+        }
     }
 }
 
@@ -767,18 +779,30 @@ void TextureRuntime::ClearTexture(Surface& surface, const VideoCore::TextureClea
         }
         return;
     }
-    FlushPendingClear(surface); // an earlier whole clear lands before a partial one
-    ClearNow(surface, clear);
+    FlushPendingClear(surface, "clear: pending flushed by a partial clear");
+    const char* why = surface.IsDepthTarget()   ? "clear: partial depth"
+                      : surface.IsColorTarget() ? "clear: small or mip colour"
+                                                : "clear: not a target";
+    if (surface.IsDepthTarget()) {
+        static u32 shown = 0;
+        if (shown < 8) {
+            shown++;
+            LOG_INFO(Render, "partial depth clear: surface {:08X} {}x{} level {} rect {}x{} at {},{}",
+                     surface.addr, surface.width, surface.height, clear.texture_level,
+                     rect.GetWidth(), rect.GetHeight(), rect.left, rect.bottom);
+        }
+    }
+    ClearNow(surface, clear, why);
 }
 
-void TextureRuntime::FlushPendingClear(Surface& surface) {
+void TextureRuntime::FlushPendingClear(Surface& surface, const char* why) {
     if (surface.pending_clear) {
         surface.pending_clear = false;
         VideoCore::TextureClear clear{};
         clear.texture_rect = Common::Rectangle<u32>{0, surface.height, surface.width, 0};
         clear.value.depth = surface.pending_depth;
         clear.value.stencil = surface.pending_stencil;
-        ClearNow(surface, clear);
+        ClearNow(surface, clear, why);
     }
     if (!surface.pending_colour.empty()) {
         std::vector<Surface::PendingColourClear> pending;
@@ -787,13 +811,14 @@ void TextureRuntime::FlushPendingClear(Surface& surface) {
             VideoCore::TextureClear clear{};
             clear.texture_rect = p.rect;
             clear.value.color = p.color;
-            ClearNow(surface, clear);
+            ClearNow(surface, clear, why);
         }
     }
 }
 
-void TextureRuntime::ClearNow(Surface& surface, const VideoCore::TextureClear& clear) {
-    Sync(&surface, nullptr, "clear");
+void TextureRuntime::ClearNow(Surface& surface, const VideoCore::TextureClear& clear,
+                              const char* why) {
+    Sync(&surface, nullptr, why);
     const GxmFormat& format = surface.Format();
     const u32 value = PackClear(format, surface.pixel_format, clear.value);
     const auto& rect = clear.texture_rect;
@@ -992,6 +1017,16 @@ bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
     const bool same_bits =
         sf.bytes_per_pixel == df.bytes_per_pixel &&
         (source.pixel_format == dest.pixel_format || (sf.native_transfer && df.native_transfer));
+    // Either end still in flight: the transfer engine would first wait for the GPU, so the
+    // fragment pipeline copies it instead, in a scene ordered behind the ones that wrote it -
+    // as CopyTextures does. Any formats: the pixel back end converts on output. Pokemon X/Y's
+    // display transfers (RGBA8 target -> RGB8 framebuffer, twice a frame) waited for the
+    // whole frame each: 1.5-2 s of every 3 s of render thread (console, 2026-11-17).
+    if (same_size && blit_hook && (NeedsWait(&source) || NeedsWait(&dest)) &&
+        blit_hook(source, dest, blit, nullptr)) {
+        stat_gpu_blits++;
+        return true;
+    }
     if (same_size && same_bits) {
         Sync(&source, &dest, "BlitTextures");
         const SceGxmTransferFormat fmt =

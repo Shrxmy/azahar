@@ -457,6 +457,11 @@ private:
     u64 report_at_ms{};
     u32 stat_frames{}, stat_draws{}, stat_vertices{}, stat_scenes{}, stat_skipped{};
     u32 stat_finishes{}, stat_syncs{}, stat_scene_breaks{}, stat_ring_peak{};
+    u32 stat_const_blends{}; ///< draws whose constant-colour blend factors were approximated
+    /// The tracedraws bring-up switch: the three frames after a surface dump ("Dump frame")
+    /// have every draw's state logged (armed through g_trace_frames_pending).
+    bool tracing_frame{};
+    u32 trace_draw_index{};
     u32 stat_uniform_uploads{}, stat_uniform_skips{}, stat_dropped_draws{}, stat_scene_waits{};
     u32 stat_gpu_blit_logs{}, stat_guest_writes{}, stat_invalidates{}, stat_flushes{};
     u32 stat_hw_draws{}, stat_hw_refused{};

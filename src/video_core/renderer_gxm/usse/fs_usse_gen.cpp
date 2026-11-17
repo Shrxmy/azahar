@@ -63,7 +63,7 @@ constexpr uint8_t TmpTex0 = 4;        ///< the three texture units' colours (4 e
 constexpr uint8_t TmpBuffer = 16;     ///< combiner_buffer (4)
 constexpr uint8_t TmpNextBuffer = 20; ///< next_combiner_buffer (4)
 constexpr uint8_t TmpPrimary = 24;    ///< the vertex colour, byte-rounded (4)
-constexpr uint8_t TmpArg = 28;        ///< the three stage arguments (4 each); lighting
+constexpr uint8_t TmpArg = 28;        ///< a stage's parked colour result (TevStage); lighting
                                       ///< scratch before the stages run
 constexpr uint8_t TmpLutCoord = 28;   ///< lighting/fog: the LUT texel coordinate (2)
 constexpr uint8_t TmpLutDelta = 30;   ///< lighting/fog: the interpolation weight (1)
@@ -2020,14 +2020,17 @@ void FragmentEmitter::TevStage(u32 index) {
         ColorOp(stage.color_op, same_op || dot3_alpha ? 0xf : 0x7);
         if (separate_alpha) {
             if (alpha_three) {
-                // i2's colour result must survive: park it, load the alphas, restore.
-                StoreVec4({Bank::Virtual, TmpOutput}, I2);
+                // i2's colour result must survive: park it, load the alphas, restore. Not in
+                // TmpOutput: that is the Previous source, and an alpha argument reading
+                // Previous then took the parked colour's junk w - Pokemon X/Y's cutscene
+                // shading pass multiplied the whole frame by 0.4 (console, 2026-11-17).
+                StoreVec4({Bank::Virtual, TmpArg}, I2);
                 load(0, 0x8);
                 load(1, 0x8);
                 load(2, 0x8);
                 ColorOp(stage.alpha_op, 0x8);
                 e.MoveInternal({I0, 0xf}, {I2, XYZW}, Pred::None, true);
-                LoadVec4(I2, {Bank::Virtual, TmpOutput});
+                LoadVec4(I2, {Bank::Virtual, TmpArg});
                 e.MoveInternal({I2, 0x8}, {I0, XYZW}, Pred::None, true);
             } else {
                 if (!alpha_early) {
@@ -2239,6 +2242,12 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     static const bool show_diffuse = GxmRenderer::GxmFlag("fs_showdiffuse");
     if (show_diffuse && uses_lighting) {
         CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpDiffuse}, 0xf);
+    }
+    // Bring-up switch fs_showtex0: a draw that samples unit 0 shows that colour alone, so a
+    // picture wrong in the combiners can be told from one wrong in what was sampled.
+    static const bool show_tex0 = GxmRenderer::GxmFlag("fs_showtex0");
+    if (show_tex0 && unit_used[0]) {
+        CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpTex0}, 0xf);
     }
     e.PackF16({Reg::Pa(0), 0xf}, Reg::V(TmpOutput), Reg::V(TmpOutput + 2));
 

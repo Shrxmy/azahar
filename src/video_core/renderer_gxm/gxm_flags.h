@@ -80,10 +80,16 @@ namespace GxmRenderer {
  *   fs_norefl, fs_nod0, fs_nod1, fs_nogeo, fs_noatten, fs_nofresnel
  *             one lighting term each taken out (as 1): the reflection LUTs, distribution
  *             0 / 1, the geometric factors, spot and distance attenuation, fresnel alpha
+ *   noblend   every PICA draw written straight to its target, blending off
+ *   tracedraws
+ *             the three frames after a "Dump frame" log every draw's target, textures,
+ *             output merger state and raw combiner stages
  *   skipdepthfx
  *             draws that sample a depth buffer read back as colour (Reinterpret) are dropped
  *   fs_showdiffuse
  *             a lit draw outputs its raw diffuse lighting instead of its combined colour
+ *   fs_showtex0
+ *             a draw sampling texture unit 0 outputs that sample instead of its combined colour
  *   fs_lightmem
  *             every light's parameters loaded from the uniform buffer's memory part instead
  *             of resident secondary attributes

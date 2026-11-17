@@ -253,6 +253,8 @@ void SetupLogging() {
     Common::Log::Filter filter;
     filter.ParseFilterString("*:Info");
     Common::Log::SetGlobalFilter(filter);
+    // Which build wrote this log: the vpk keeps its name across rebuilds.
+    LOG_INFO(Frontend, "build {} {}", __DATE__, __TIME__);
 #endif
     // The release build starts no logging backend at all, so every LOG_* macro reaches a
     // filter that discards it before it formats anything.

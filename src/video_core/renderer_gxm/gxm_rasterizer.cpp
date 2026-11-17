@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <bit>
 #include <cstring>
@@ -42,6 +43,9 @@ static inline int sceIoMkdir(const char*, int) {
 namespace GxmRenderer {
 
 namespace {
+
+/// tracedraws: frames still to be traced, armed by DumpSurfaces (see EndFrame).
+std::atomic<u32> g_trace_frames_pending{0};
 
 // Sized from what a title actually produces: Super Mario 3D Land reaches ~50k vertices a
 // frame at 96 bytes each, so 4 MiB was under one frame's worth and the producer stalled on it
@@ -439,6 +443,21 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
     // free: GXM context state already persists across scene boundaries, the source cannot be
     // what this scene renders into (overlap was refused above), and the destination is held
     // by the open scene's serial rather than one of its own.
+    // Clears queued on the destination come before this blit. Its own scene does not draw
+    // them, so left pending they were landed after it, by the next texture bind - on top of
+    // what it wrote, behind a wait for it: Pokemon X/Y's depth read back as colour, 1.7 s of
+    // every 3 s of render thread outdoors (console, 2026-11-17). Clears the blit overwrites
+    // whole are dropped; any other is landed first.
+    if (dest.HasPendingClear()) {
+        const auto& r = blit.dst_rect;
+        std::erase_if(dest.pending_colour, [&](const Surface::PendingColourClear& p) {
+            return p.rect.left >= r.left && p.rect.right <= r.right &&
+                   p.rect.bottom >= r.bottom && p.rect.top <= r.top;
+        });
+        if (dest.HasPendingClear()) {
+            runtime.FlushPendingClear(dest, "clear: pending landed before a gpu blit");
+        }
+    }
     // Not when the open scene renders into the source either: a depth source is a separate
     // allocation from the colour target, so the overlap test above does not see it.
     const bool merged = in_scene && scene_fb != nullptr && scene_fb->color_id &&
@@ -1399,13 +1418,40 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     // Bring-up switch: every draw written straight to the target. A picture that comes right
     // without blending puts the fault in the blend or in what it reads back, not in what the
     // shader computed.
-    if (om.alphablend_enable == 1) {
-        blend.colorFunc = PicaToGxm::BlendEquation(om.alpha_blending.blend_equation_rgb);
-        blend.alphaFunc = PicaToGxm::BlendEquation(om.alpha_blending.blend_equation_a);
-        blend.colorSrc = PicaToGxm::BlendFactor(om.alpha_blending.factor_source_rgb);
-        blend.colorDst = PicaToGxm::BlendFactor(om.alpha_blending.factor_dest_rgb);
-        blend.alphaSrc = PicaToGxm::BlendFactor(om.alpha_blending.factor_source_a);
-        blend.alphaDst = PicaToGxm::BlendFactor(om.alpha_blending.factor_dest_a);
+    static const bool no_blend = GxmFlag("noblend");
+    if (om.alphablend_enable == 1 && !no_blend) {
+        const auto& ab = om.alpha_blending;
+        blend.colorFunc = PicaToGxm::BlendEquation(ab.blend_equation_rgb);
+        blend.alphaFunc = PicaToGxm::BlendEquation(ab.blend_equation_a);
+        blend.colorSrc = PicaToGxm::BlendFactor(ab.factor_source_rgb);
+        blend.colorDst = PicaToGxm::BlendFactor(ab.factor_dest_rgb);
+        blend.alphaSrc = PicaToGxm::BlendFactor(ab.factor_source_a);
+        blend.alphaDst = PicaToGxm::BlendFactor(ab.factor_dest_a);
+        // The constant-colour factors are approximated (PicaToGxm::BlendFactor): count the
+        // draws that hit it, and say what they asked for the first few times.
+        using F = Pica::FramebufferRegs::BlendFactor;
+        const auto constant = [](F f) {
+            return f == F::ConstantColor || f == F::OneMinusConstantColor ||
+                   f == F::ConstantAlpha || f == F::OneMinusConstantAlpha;
+        };
+        if (constant(ab.factor_source_rgb) || constant(ab.factor_dest_rgb) ||
+            constant(ab.factor_source_a) || constant(ab.factor_dest_a)) {
+            stat_const_blends++;
+            static u32 shown = 0;
+            if (shown < 16) {
+                shown++;
+                LOG_INFO(Render,
+                         "constant blend (approximated): rgb {} {} eq {}, a {} {} eq {}, "
+                         "constant {:08X}, target {:08X}",
+                         static_cast<u32>(ab.factor_source_rgb.Value()),
+                         static_cast<u32>(ab.factor_dest_rgb.Value()),
+                         static_cast<u32>(ab.blend_equation_rgb.Value()),
+                         static_cast<u32>(ab.factor_source_a.Value()),
+                         static_cast<u32>(ab.factor_dest_a.Value()),
+                         static_cast<u32>(ab.blend_equation_a.Value()), om.blend_const.raw,
+                         fb_regs.GetColorBufferPhysicalAddress());
+            }
+        }
     } else {
         blend.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
         blend.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
@@ -1829,7 +1875,19 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         // as-is (the tiler reads what was stored before this scene) rather than white.
         (void)framebuffer;
         if (surface.HasPendingClear()) {
-            runtime.FlushPendingClear(surface);
+            static u32 shown = 0;
+            if (shown < 12) {
+                shown++;
+                LOG_INFO(Render,
+                         "pending clear flushed by a texture bind: unit {} surface {:08X} {}x{} "
+                         "{} {} target, depth pending {}, {} colour clears, drawing into {:08X}",
+                         unit, surface.addr, surface.width, surface.height,
+                         VideoCore::PixelFormatAsString(surface.pixel_format),
+                         surface.IsColorTarget() ? "colour" : (surface.IsDepthTarget() ? "depth" : "no"),
+                         surface.pending_clear, surface.pending_colour.size(),
+                         regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress());
+            }
+            runtime.FlushPendingClear(surface, "clear: pending flushed by a texture bind");
         }
         SceGxmTexture bound = *surface.Texture();
         res_cache.GetSampler(texture.config).Apply(bound);
@@ -1917,6 +1975,42 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                 return false;
             }
         }
+    }
+    // Bring-up switch tracedraws: a traced frame logs every draw's target, textures, output
+    // merger and combiner stages (raw: sources/modifiers/ops/scales/constant per stage).
+    if (tracing_frame) {
+        const auto& ab = om.alpha_blending;
+        std::string units;
+        for (u32 u = 0; u < bound_surfaces.size(); u++) {
+            if (bound_surfaces[u]) {
+                const Surface& t = res_cache.GetSurface(bound_surfaces[u]);
+                units += fmt::format(" u{} {:08X} {}x{} {}{}", u, t.addr, t.width, t.height,
+                                     VideoCore::PixelFormatAsString(t.pixel_format),
+                                     t.from_depth ? " (from depth)" : "");
+            }
+        }
+        std::string tev;
+        const auto stages = regs.texturing.GetTevStages();
+        for (u32 i = 0; i < stages.size(); i++) {
+            const auto& s = stages[i];
+            tev += fmt::format(" s{} {:08X}/{:08X}/{:08X}/{:08X}/{:08X}", i, s.sources_raw,
+                               s.modifiers_raw, s.ops_raw, s.scales_raw, s.const_color);
+        }
+        LOG_INFO(Render,
+                 "trace draw {}: colour {:08X} depth {:08X} mask {}{}{}{} blend {} eq {}/{} "
+                 "factors {} {} {} {} const {:08X} logic {} alpha test {} {} {} depth test {} {} "
+                 "write {} lighting {} fog {}; textures{}; tev{}",
+                 trace_draw_index++, fb_regs.framebuffer.GetColorBufferPhysicalAddress(),
+                 fb_regs.framebuffer.GetDepthBufferPhysicalAddress(), u32(om.red_enable),
+                 u32(om.green_enable), u32(om.blue_enable), u32(om.alpha_enable),
+                 u32(om.alphablend_enable), u32(ab.blend_equation_rgb.Value()),
+                 u32(ab.blend_equation_a.Value()), u32(ab.factor_source_rgb.Value()),
+                 u32(ab.factor_dest_rgb.Value()), u32(ab.factor_source_a.Value()),
+                 u32(ab.factor_dest_a.Value()), om.blend_const.raw, u32(om.logic_op.Value()),
+                 u32(om.alpha_test.enable), u32(om.alpha_test.func.Value()),
+                 u32(om.alpha_test.ref), u32(om.depth_test_enable),
+                 u32(om.depth_test_func.Value()), u32(om.depth_write_enable),
+                 u32(!regs.lighting.disable), u32(regs.texturing.fog_mode.Value()), units, tev);
     }
     {
         const PhaseTimer timer{time_draws, times.scene};
@@ -2734,7 +2828,7 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
         }
     }
     if (Surface& shown = res_cache.GetSurface(surface_id); shown.HasPendingClear()) {
-        runtime.FlushPendingClear(shown);
+        runtime.FlushPendingClear(shown, "clear: pending flushed by a present");
     }
     res_cache.GetSurface(surface_id).presented = true;
     if (out_rect != nullptr) {
@@ -2751,6 +2845,14 @@ void RasterizerGxm::EndFrame() {
         return;
     }
     const PhaseTimer end_frame_timer{time_draws, times.end_frame};
+    // tracedraws: the frames after a "Dump frame" (DumpSurfaces arms them) log every draw.
+    u32 pending = g_trace_frames_pending.load(std::memory_order_relaxed);
+    tracing_frame = pending > 0 &&
+                    g_trace_frames_pending.compare_exchange_strong(pending, pending - 1);
+    if (tracing_frame) {
+        trace_draw_index = 0;
+        LOG_INFO(Render, "trace: frame follows ({} more after it)", pending - 1);
+    }
     EndScene();
     InstallTier2();
     // No finish: the GPU keeps this frame's scenes while the next frame is being submitted.
@@ -2884,6 +2986,20 @@ void RasterizerGxm::EndFrame() {
             }
             LOG_INFO(Render, "gxm scenes of the last frame: {}", scenes);
         }
+        if (!runtime.sync_reasons.empty()) {
+            std::string reasons;
+            for (const auto& r : runtime.sync_reasons) {
+                reasons += fmt::format("{}{} {}x {} ms", reasons.empty() ? "" : ", ", r.why,
+                                       r.count, r.us / 1000);
+            }
+            LOG_INFO(Render, "gxm sync waits by caller: {}", reasons);
+            runtime.sync_reasons.clear();
+        }
+        if (stat_const_blends != 0) {
+            LOG_INFO(Render, "gxm constant-colour blends approximated: {} draws",
+                     stat_const_blends);
+            stat_const_blends = 0;
+        }
         if (time_draws) {
             // What the GPU thread charged to itself over the same window, so the phases can
             // be read against the thread's own busy time and not only against the wall. From
@@ -2939,6 +3055,12 @@ void RasterizerGxm::EndFrame() {
 }
 
 void RasterizerGxm::DumpSurfaces() {
+    static const bool trace_draws = GxmFlag("tracedraws");
+    if (trace_draws) {
+        // The frames after this one are traced (EndFrame). Shared, not a member: the dump
+        // hook need not run on the instance that draws the frames (console, 2026-11-17).
+        g_trace_frames_pending.store(3, std::memory_order_relaxed);
+    }
     // Level 0 of every surface with memory, read back the way a download is (through the
     // transfer unit, which is the only way a rendered surface's pixels reach the CPU under
     // Vita3K), as a PPM of its colour or depth plus a PGM of its alpha or stencil where the

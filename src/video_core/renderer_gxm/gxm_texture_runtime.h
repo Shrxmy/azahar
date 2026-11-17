@@ -141,7 +141,8 @@ public:
     void Sync(Surface* a = nullptr, Surface* b = nullptr, const char* why = "?");
     /// Writes a deferred whole-surface depth clear into memory, the way a partial clear
     /// is done, when the memory is about to be read or written outside a scene.
-    void FlushPendingClear(Surface& surface);
+    /// `why` names the caller in the sync report (sync_reasons).
+    void FlushPendingClear(Surface& surface, const char* why = "clear: pending flushed");
 
     /**
      * Converts one surface into another with a draw, or declines.
@@ -263,11 +264,19 @@ public:
     u32 stat_gpu_blit_merges{};
     u32 stat_deferred_clears{}; ///< whole-surface depth clears handed to the next scene
     u32 stat_syncs{}, stat_syncs_avoided{};
+    /// The waits Sync really made, by its `why` (a string literal), with their time when the
+    /// timedraw switch is on: which callers keep the CPU and GPU from overlapping.
+    struct SyncReason {
+        const char* why;
+        u32 count;
+        u64 us;
+    };
+    std::vector<SyncReason> sync_reasons;
 
 private:
     /// Waits for the PTLA; every transfer is followed by one at this phase.
     void TransferWait();
-    void ClearNow(Surface& surface, const VideoCore::TextureClear& clear);
+    void ClearNow(Surface& surface, const VideoCore::TextureClear& clear, const char* why);
     bool CpuBlit(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit);
 
     [[nodiscard]] bool NeedsWait(const Surface* surface) const;
