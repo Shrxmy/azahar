@@ -419,6 +419,11 @@ void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, u
 
 void Builder::Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words,
                     uint8_t count, uint8_t drc) {
+    // Every pass models a load as writing one quad (WriteLanes, WrittenRegs, the intervals),
+    // and virtual quads are placed independently: a wider load would overrun its quad.
+    if (dst.bank == Bank::Virtual && count > 4) {
+        throw std::runtime_error("a load into virtual registers spans more than one quad");
+    }
     Inst& i = Push(Op::Lda32);
     i.reg[0] = dst;
     i.reg[1] = base_sa;

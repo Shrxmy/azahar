@@ -689,7 +689,36 @@ void TextureRuntime::TransferWait() {
     sceGxmTransferFinish();
 }
 
-bool TextureRuntime::Reinterpret(Surface& source, Surface& dest, const VideoCore::TextureCopy&) {
+bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
+                                 const VideoCore::TextureCopy& copy) {
+    // D24S8 read back as RGBA8 (Pokemon X/Y, every frame): the guest word (stencil on top) is
+    // GXM's S8D24, and U8U8U8U8_RGBA samples it as (stencil, d[23:16], d[15:8], d[7:0]) - the
+    // R,G,B,A the codec decodes from that word as RGBA8. A blit through that view is the round
+    // trip through guest memory without its GPU drain, download and upload (1.3 a frame).
+    if (blit_hook && source.pixel_format == PixelFormat::D24S8 &&
+        dest.pixel_format == PixelFormat::RGBA8 && copy.extent.width != 0 &&
+        copy.extent.height != 0) {
+        static constexpr SceGxmTextureFormat view = SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_RGBA;
+        const VideoCore::TextureBlit blit{
+            .src_level = copy.src_level,
+            .dst_level = copy.dst_level,
+            .src_layer = copy.src_layer,
+            .dst_layer = copy.dst_layer,
+            .src_rect = Common::Rectangle<u32>{copy.src_offset.x,
+                                               copy.src_offset.y + copy.extent.height,
+                                               copy.src_offset.x + copy.extent.width,
+                                               copy.src_offset.y},
+            .dst_rect = Common::Rectangle<u32>{copy.dst_offset.x,
+                                               copy.dst_offset.y + copy.extent.height,
+                                               copy.dst_offset.x + copy.extent.width,
+                                               copy.dst_offset.y},
+        };
+        if (blit_hook(source, dest, blit, &view)) {
+            stat_gpu_blits++;
+            dest.from_depth = true;
+            return true;
+        }
+    }
     static bool warned = false;
     if (!warned) {
         LOG_WARNING(Render,
@@ -887,7 +916,7 @@ bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
                                                    copy.dst_offset.x + copy.extent.width,
                                                    copy.dst_offset.y},
             };
-            if (!blit_hook(source, dest, blit)) {
+            if (!blit_hook(source, dest, blit, nullptr)) {
                 all = false;
                 break;
             }
@@ -976,7 +1005,7 @@ bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
             TransferWait();
             return true;
         }
-    } else if (!same_bits && blit_hook && blit_hook(source, dest, blit)) {
+    } else if (!same_bits && blit_hook && blit_hook(source, dest, blit, nullptr)) {
         // A format change: no PTLA path exists, so the fragment pipeline converts it.
         stat_gpu_blits++;
         return true;

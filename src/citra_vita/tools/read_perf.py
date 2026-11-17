@@ -45,9 +45,11 @@ def read_records(path):
         if version >= 4:
             irq = IRQ.unpack_from(blob, off + FIXED.size + 4 * PMU.size + EXTRA.size)
         brake_us = None
-        if version >= 5:
-            brake_us = struct.unpack_from(
-                "<Q", blob, off + FIXED.size + 4 * PMU.size + EXTRA.size + IRQ.size)[0]
+        brake_off = FIXED.size + 4 * PMU.size + EXTRA.size + IRQ.size
+        # The writer's v5 record (citra_vita_main.cpp, 384 bytes) ends before brake_us; trust
+        # the header's record size over the version number.
+        if version >= 5 and rec_size >= brake_off + 8:
+            brake_us = struct.unpack_from("<Q", blob, off + brake_off)[0]
         yield fixed, pmus, extra, irq, brake_us
         off += rec_size
 

@@ -71,6 +71,22 @@ namespace GxmRenderer {
  *   usse_dump every emitted program to ux0:data/azahar/usse/us_<hash>.gxp with a .txt of
  *             its configuration (fragment) and uv_<key>.gxp (vertex), for the SDK tools
  *             off the console
+ *   usse_noschedall
+ *             every fragment instruction gets its nosched bit (FinishNosched's override 2),
+ *             so per-pixel noise from a scheduling hazard can be told from a wrong value
+ *   fs_nolighting, fs_nospecular, fs_nofog
+ *             fragment bisecting by stage: lighting leaves white diffuse and no specular,
+ *             specular only is dropped, or fog is skipped
+ *   fs_norefl, fs_nod0, fs_nod1, fs_nogeo, fs_noatten, fs_nofresnel
+ *             one lighting term each taken out (as 1): the reflection LUTs, distribution
+ *             0 / 1, the geometric factors, spot and distance attenuation, fresnel alpha
+ *   skipdepthfx
+ *             draws that sample a depth buffer read back as colour (Reinterpret) are dropped
+ *   fs_showdiffuse
+ *             a lit draw outputs its raw diffuse lighting instead of its combined colour
+ *   fs_lightmem
+ *             every light's parameters loaded from the uniform buffer's memory part instead
+ *             of resident secondary attributes
  *   usse_nohoist, usse_nocse, usse_nomadfold
  *       Tier 2 bisecting: no load hoisting (and so no shared chains or reuse), no reuse of
  *       an earlier read of the same uniform, no direct two-wide mads.

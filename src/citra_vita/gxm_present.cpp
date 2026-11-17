@@ -568,6 +568,13 @@ void StartGpuLive() {
         return;
     }
     const int hud = hud_module;
+    if (hud < 0) {
+        // The sceRazor* imports are weak: with the module absent they resolve to nothing, and
+        // calling one jumps to address zero ("Save Core File" on a retail console).
+        LOG_WARNING(Frontend, "GPU Live: Razor HUD module unavailable ({:#x}); counters off",
+                    static_cast<u32>(hud));
+        return;
+    }
     for (u32 i = 0; i < MaxDisplayBuffers; i++) {
         const SceUID uid = sceKernelAllocMemBlock(
             "azahar-gpulive", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, GpuLive::BufferSize, nullptr);

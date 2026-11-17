@@ -236,10 +236,9 @@ public:
 /**
  * Backend that writes to the PS Vita's debug channel.
  *
- * The only backend on that target. A file backend would write to the memory card through the
- * same emulator that is being debugged, and there is no console attached to write to - the
- * kernel's own channel, which a logger plugin picks up, reaches a developer either way and needs
- * nothing from the process beyond the call itself.
+ * The kernel's own channel, which a logger plugin picks up, needs nothing from the process
+ * beyond the call itself and survives a crash. The file backend runs beside it so a log can be
+ * fetched over FTP with no plugin installed; its last buffered lines are lost if the process dies.
  */
 class VitaBackend final : public Backend {
 public:
@@ -414,8 +413,8 @@ private:
         : filter{filter_}, file_backend{""}, libretro_backend{callback} {}
 #endif
 #ifdef __vita__
-    Impl([[maybe_unused]] const std::string& file_backend_filename, const Filter& filter_)
-        : filter{filter_} {}
+    Impl(const std::string& file_backend_filename, const Filter& filter_)
+        : filter{filter_}, file_backend{file_backend_filename} {}
 #else
     Impl(const std::string& file_backend_filename, const Filter& filter_)
         : filter{filter_}, file_backend{file_backend_filename} {
@@ -495,6 +494,7 @@ private:
     void ForEachBackend(auto lambda) {
 #if defined(__vita__)
         lambda(static_cast<Backend&>(vita_backend));
+        lambda(static_cast<Backend&>(file_backend));
 #elif defined(HAVE_LIBRETRO)
         lambda(static_cast<Backend&>(libretro_backend));
 #else
@@ -547,6 +547,7 @@ private:
     boost::regex regex_filter;
 #ifdef __vita__
     VitaBackend vita_backend{};
+    FileBackend file_backend;
 #else
     DebuggerBackend debugger_backend{};
     ColorConsoleBackend color_console_backend{};

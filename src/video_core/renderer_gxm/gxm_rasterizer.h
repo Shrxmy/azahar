@@ -205,7 +205,9 @@ private:
     bool EnsureResources();
     /// Converts `source` into `dest` with a textured quad, letting the pixel back end do the
     /// format change on output. False when this backend cannot express the pair.
-    bool GpuBlit(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit);
+    /// `view_format` samples the source's memory as that format (TextureRuntime::BlitHook).
+    bool GpuBlit(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit,
+                 const SceGxmTextureFormat* view_format = nullptr);
     /// A render target of these dimensions, made once and kept: the SDK asks for render
     /// targets to be created at load time because creating one costs OS resources.
     [[nodiscard]] SceGxmRenderTarget* BlitTargetFor(u32 width, u32 height);
@@ -432,10 +434,10 @@ private:
         u64 left_serial[2]{}; ///< per half: the last scene that may sample its rows
     };
     LutTexture lut_lf, lut_rg, lut_rgba;
-    /// Hands out `needed` LUT rows: wraps the ring when they do not fit (the caller then
-    /// re-uploads every LUT of that texture) and, on entering the other half of the ring,
-    /// waits for the scenes that last sampled it, which a ring of a few frames' rows makes
-    /// a wait that is over before it starts.
+    /// Hands out `needed` LUT rows from the current half of the ring. When they do not fit it
+    /// moves to the start of the other half, waits for the scenes that last sampled it (a
+    /// ring of a few frames' rows makes that a wait over before it starts) and returns true:
+    /// the caller must then re-upload every LUT of that texture, so none is left behind.
     bool ReserveLutRows(LutTexture& lut, u32 needed);
     u32 stat_lut_waits{};
     u32 stat_trimmed{}; ///< surfaces given up because the pool was filling

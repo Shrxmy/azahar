@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <fmt/format.h>
+#include "common/logging/log.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
@@ -622,13 +623,19 @@ void FragmentEmitter::PlanUniforms() {
         // literals, the sampler words and the pointer behind them; the rest live in the
         // memory part of the uniform buffer and are loaded when their turn comes.
         const uint32_t tail = LiteralCount + static_cast<uint32_t>(gxp.samplers.size()) * 4 + 1;
+        // Bring-up switch fs_lightmem: every light from the uniform buffer's memory part, to
+        // tell the load path from the register-resident one.
+        static const bool all_in_memory = GxmRenderer::GxmFlag("fs_lightmem");
+        u32 spilled = 0;
         for (u32 i = 0; i < lighting.src_num; i++) {
             const u32 num = lighting.lights[i].num;
             const char* members[8] = {"specular_0", "dist_atten_bias", "specular_1",
                                       "dist_atten_scale", "diffuse", "ambient", "position",
                                       "spot_direction"};
             const uint8_t sizes[8] = {3, 1, 3, 1, 3, 3, 3, 3};
-            const bool resident_light = ((uniform_floats + 1) & ~1u) + 24 + tail <= 128;
+            const bool fits = ((uniform_floats + 1) & ~1u) + 24 + tail <= 128;
+            spilled += fits ? 0 : 1;
+            const bool resident_light = fits && !all_in_memory;
             for (int m = 0; m < 8; m++) {
                 const std::string name = fmt::format("light_src[{}].{}", num, members[m]);
                 if (resident_light) {
@@ -644,6 +651,10 @@ void FragmentEmitter::PlanUniforms() {
                 }
             }
         }
+        LOG_INFO(Render, "fs lighting: {} lights, {} past the register budget{}, bump {}, config {}",
+                 static_cast<u32>(lighting.src_num), spilled, all_in_memory ? " (all forced to memory)" : "",
+                 static_cast<u32>(lighting.bump_mode.Value()),
+                 static_cast<u32>(lighting.config.Value()));
     }
     if (!memory_uniforms.empty()) {
         // The pointer takes the data container's first SA; an odd resident count keeps the
@@ -685,9 +696,15 @@ Vec4Loc FragmentEmitter::LightParams(uint32_t num) {
         throw std::runtime_error("light parameters past the load offset's reach");
     }
     const Reg ptr = Reg::Sa(static_cast<uint8_t>(uniform_floats)); // data container offset 0
-    e.Lda32(Reg::V(TmpLightMem), ptr, nullptr, static_cast<uint8_t>(off), 16, 0);
-    e.Lda32(Reg::V(TmpLightMem + 16), ptr, nullptr, static_cast<uint8_t>(off + 16), 4, 0);
-    e.Lda32(Reg::V(TmpLightMem + 20), ptr, nullptr, static_cast<uint8_t>(off + 20), 4, 0);
+    // One quad per load: the IR places each virtual quad on its own and models a load as
+    // writing one quad, so a 16-float burst landed specular_1, diffuse and ambient in
+    // registers the allocator had given to other values, and the reads behind it took
+    // leftovers - Pokemon X/Y's single-channel speckles on every spilled light (console,
+    // 2026-11-17).
+    for (uint8_t q = 0; q < 24; q += 4) {
+        e.Lda32(Reg::V(static_cast<uint8_t>(TmpLightMem + q)), ptr, nullptr,
+                static_cast<uint8_t>(off + q), 4, 0);
+    }
     e.WdfVertex(0);
     return {Bank::Virtual, TmpLightMem};
 }
@@ -1242,6 +1259,15 @@ void FragmentEmitter::Lighting() {
     const Reg dot_product = Reg::V(TmpMisc);   // .x; .y the squared half vector length
     const Reg misc_hi = Reg::V(TmpMisc + 2);   // .x clamp_highlights, .y light distance
     const bool config7 = lighting.config == LightingRegs::LightingConfig::Config7;
+    // Bring-up switches, each taking one term of the lighting equation out (as 1): the
+    // reflection LUTs, the two distribution LUTs, the geometric factors, the spot and
+    // distance attenuation, and the fresnel alpha.
+    static const bool no_refl = GxmRenderer::GxmFlag("fs_norefl");
+    static const bool no_d0 = GxmRenderer::GxmFlag("fs_nod0");
+    static const bool no_d1 = GxmRenderer::GxmFlag("fs_nod1");
+    static const bool no_geo = GxmRenderer::GxmFlag("fs_nogeo");
+    static const bool no_atten = GxmRenderer::GxmFlag("fs_noatten");
+    static const bool no_fresnel = GxmRenderer::GxmFlag("fs_nofresnel");
 
     // diffuse_sum = specular_sum = (0, 0, 0, 1): the alpha here, the colour by the first
     // light's store (or zero below when there is none).
@@ -1515,6 +1541,7 @@ void FragmentEmitter::Lighting() {
         // (psp2cgc does that) drew a 32-pixel tile pattern over every lit surface on the
         // console, 2026-09-06: the tiles of one fragment job do not all see the same
         // secondary attributes once the secondary program has written them.
+        const bool dist_on = light.dist_atten_enable && !no_atten;
         LoadVec4(I0, position);
         if (!light.directional) {
             LoadVec4(I1, view);
@@ -1522,7 +1549,7 @@ void FragmentEmitter::Lighting() {
         }
         e.Dot({I1, 0x1}, {I0, XYZW}, {I0, XYZW}, false, Pred::None, true);
         e.Comp(CompOp::Rsq, {I1, 0x2}, {I1}, 0, Pred::None, true);
-        if (light.dist_atten_enable) {
+        if (dist_on) {
             e.Vec(VecOp::Mul, {I1, 0x1}, {I1, XYZW}, {I1, YYYY}, Pred::None, true); // length
             e.MoveInternal({misc_hi, 0x2}, {I1, XXXX}, Pred::None, true);           // .y = distance
         }
@@ -1531,8 +1558,8 @@ void FragmentEmitter::Lighting() {
         CopyVec4({Bank::Virtual, TmpLightAcc}, spot, 0x7);
         // half_vector = normalize(nview + light_vector); its squared length kept for the
         // geometric factor.
-        const bool geo0 = light.geometric_factor_0;
-        const bool geo1 = light.geometric_factor_1;
+        const bool geo0 = light.geometric_factor_0 && !no_geo;
+        const bool geo1 = light.geometric_factor_1 && !no_geo;
         if (needs_half) {
             LoadVec4(I1, nview);
             e.Vec(VecOp::Add, {I1, 0x7}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
@@ -1572,9 +1599,9 @@ void FragmentEmitter::Lighting() {
         }
         // Attenuation: spot and distance, multiplied into `atten`.x (starts at 1; no
         // register at all when neither is on).
-        const bool spot_on = light.spot_atten_enable &&
+        const bool spot_on = light.spot_atten_enable && !no_atten &&
                              LightingLutEnabled(lighting.lut_sp, Sampler::SpotlightAttenuation);
-        const bool atten_on = spot_on || light.dist_atten_enable;
+        const bool atten_on = spot_on || dist_on;
         if (atten_on) {
             e.MoveInternal({atten, 0x1}, {Reg::C(2), XXXX}, Pred::None, true);
         }
@@ -1583,7 +1610,7 @@ void FragmentEmitter::Lighting() {
                       two_sided);
             e.Vec(VecOp::Mul, {atten, 0x1}, {atten, XYZW}, {I0, XXXX}, Pred::None, true);
         }
-        if (light.dist_atten_enable) {
+        if (dist_on) {
             // index = clamp(scale * distance + bias, 0, 1), unsigned lookup
             e.Vec(VecOp::Mul, {I0, 0x1}, {misc_hi, YYYY}, Scalar(pb, sa + 7), Pred::None, true);
             e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, Scalar(pb, sa + 3), Pred::None, true);
@@ -1597,11 +1624,11 @@ void FragmentEmitter::Lighting() {
         // (the spot direction is no longer needed by then); no register when all three
         // LUTs are off (refl = 1).
         const Vec4Loc acc{Bank::Virtual, TmpLightAcc};
-        const bool rr = LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
-        const bool rg = LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen);
-        const bool rb = LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
-        const bool d1_on = LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1);
-        const bool d0_on = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
+        const bool rr = !no_refl && LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
+        const bool rg = !no_refl && LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen);
+        const bool rb = !no_refl && LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
+        const bool d1_on = !no_d1 && LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1);
+        const bool d0_on = !no_d0 && LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
         const bool refl_on = rr || rg || rb;
         if (refl_on) {
             if (rg) {
@@ -1706,7 +1733,8 @@ void FragmentEmitter::Lighting() {
         // The fresnel term, on the last light, into the alphas asked for.
         const bool fresnel_primary = uses_primary_color && lighting.enable_primary_alpha;
         const bool fresnel_secondary = uses_secondary_color && lighting.enable_secondary_alpha;
-        if (light_index + 1 == lighting.src_num && (fresnel_primary || fresnel_secondary) &&
+        if (!no_fresnel && light_index + 1 == lighting.src_num &&
+            (fresnel_primary || fresnel_secondary) &&
             LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel)) {
             lut_value(lighting.lut_fr, Sampler::Fresnel, two_sided);
             if (fresnel_primary) {
@@ -2148,7 +2176,10 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     // after the next instruction). Setting the bit everywhere cured the noise and cost
     // the GPU its instance switching; FinishNosched now places it as the compiler does.
     // skipinv made no difference on the console and stays clear, as the ubershader has it.
-    e.nosched_override = 0;
+    // Bring-up switch usse_noschedall: the bit on every instruction again, the setting that
+    // cured that noise, to tell a scheduling hazard from a wrong computation on the console.
+    static const bool nosched_all = GxmRenderer::GxmFlag("usse_noschedall");
+    e.nosched_override = nosched_all ? 2 : 0;
     e.skip_invalid = false;
 
     // A kill ends its phase: psp2cgc follows every kill with its nop and then a new phase
@@ -2171,6 +2202,20 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     }
     if (uses_lighting) {
         Lighting();
+        // Bring-up switches: fs_nolighting leaves diffuse white and specular black, so a
+        // wrong picture can be pinned on the lighting; fs_nospecular drops specular only.
+        static const bool no_lighting = GxmRenderer::GxmFlag("fs_nolighting");
+        static const bool no_specular = no_lighting || GxmRenderer::GxmFlag("fs_nospecular");
+        const Vec4Loc diffuse{Bank::Virtual, TmpDiffuse};
+        const Vec4Loc specular{Bank::Virtual, TmpSpecular};
+        if (no_lighting) {
+            e.Vec(VecOp::Add, {diffuse.Pair(0), 0x3}, ConstZero, ConstOne);
+            e.Vec(VecOp::Add, {diffuse.Pair(1), 0x1}, ConstZero, ConstOne);
+        }
+        if (no_specular) {
+            e.Vec(VecOp::Add, {specular.Pair(0), 0x3}, ConstZero, ConstZero);
+            e.Vec(VecOp::Add, {specular.Pair(1), 0x1}, ConstZero, ConstZero);
+        }
     }
     // combiner_output starts at zero; the buffers at zero and the register value.
     e.Vec(VecOp::Add, {Reg::V(TmpOutput), 0x3}, ConstZero, ConstZero);
@@ -2185,7 +2230,16 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
         WriteDepth();
         NewPhaseAfterKill();
     }
-    Fog();
+    static const bool no_fog = GxmRenderer::GxmFlag("fs_nofog"); // bring-up switch
+    if (!no_fog) {
+        Fog();
+    }
+    // Bring-up switch fs_showdiffuse: a lit draw shows its raw diffuse lighting instead of
+    // its combined colour, so the lighting's own output can be looked at in a frame.
+    static const bool show_diffuse = GxmRenderer::GxmFlag("fs_showdiffuse");
+    if (show_diffuse && uses_lighting) {
+        CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpDiffuse}, 0xf);
+    }
     e.PackF16({Reg::Pa(0), 0xf}, Reg::V(TmpOutput), Reg::V(TmpOutput + 2));
 
     // The quads go to the temporaries, then to primary attributes past the interpolants.

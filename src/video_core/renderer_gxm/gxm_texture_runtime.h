@@ -151,8 +151,12 @@ public:
      * hardware path and fell to a CPU pass over every texel. The fragment pipeline has one:
      * a textured quad into the destination's colour surface converts on output, in the pixel
      * back end, for nothing. Set by the rasterizer, which owns the programs and the context.
+     * `view_format`, when given, samples the source's memory as that format instead of its
+     * own (same texel size): a reinterpretation rather than a conversion.
      */
-    void SetBlitHook(std::function<bool(Surface&, Surface&, const VideoCore::TextureBlit&)> hook) {
+    using BlitHook = std::function<bool(Surface&, Surface&, const VideoCore::TextureBlit&,
+                                        const SceGxmTextureFormat* view_format)>;
+    void SetBlitHook(BlitHook hook) {
         blit_hook = std::move(hook);
     }
 
@@ -270,7 +274,7 @@ private:
 
     std::function<void(u64)> sync_hook;
     std::function<bool(Surface&)> colour_clear_hook;
-    std::function<bool(Surface&, Surface&, const VideoCore::TextureBlit&)> blit_hook;
+    BlitHook blit_hook;
     u64 current_resource_tick{};
     /// Scene serials. `scene_serial` is the last one claimed; `completed_floor` is what a
     /// full wait has already proved finished, which is what makes the notification's 32-bit
@@ -362,6 +366,9 @@ public:
     /// presentation layer was handed it to sample from a scene this renderer did not record.
     u64 gpu_serial{};
     bool presented{};
+    /// Filled at least once by TextureRuntime::Reinterpret from a depth surface; read only by
+    /// the skipdepthfx bring-up switch.
+    bool from_depth{};
     /// A whole-surface depth clear waiting for the next scene on this surface, which
     /// starts from the value instead of loading memory (BeginScene applies it). Anything
     /// that reads or writes the memory before then lands it first (FlushPendingClear).

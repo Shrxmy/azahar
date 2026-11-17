@@ -185,8 +185,9 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
     });
     SetSurfaceDumpHook([](void* self) { static_cast<RasterizerGxm*>(self)->DumpSurfaces(); },
                        this);
-    runtime.SetBlitHook([this](Surface& source, Surface& dest, const VideoCore::TextureBlit& blit) {
-        return GpuBlit(source, dest, blit);
+    runtime.SetBlitHook([this](Surface& source, Surface& dest, const VideoCore::TextureBlit& blit,
+                               const SceGxmTextureFormat* view_format) {
+        return GpuBlit(source, dest, blit, view_format);
     });
     // The ring is claimed here rather than in EnsureResources, because the facade asks for it
     // (SetRealRasterizer) before any draw reaches this rasterizer. Only the memory is needed,
@@ -381,7 +382,8 @@ SceGxmRenderTarget* RasterizerGxm::BlitTargetFor(u32 width, u32 height) {
     return target;
 }
 
-bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit) {
+bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit,
+                            const SceGxmTextureFormat* view_format) {
     static const bool no_gpu_blit = GxmFlag("nogpublit");
     if (no_gpu_blit || !resources_ready || !HasDevice() || blit_ring == nullptr) {
         return false;
@@ -404,6 +406,13 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
         if (shader == nullptr || !shader->IsDone() || shader->failed) {
             return false;
         }
+    }
+
+    // The source as sampled: its own texture, or its memory under another format of the same
+    // texel size. Made before any scene is touched, so a refusal costs nothing.
+    SceGxmTexture bound = *source.Texture();
+    if (view_format != nullptr && sceGxmTextureSetFormat(&bound, *view_format) < 0) {
+        return false;
     }
 
     const bool flip = blit.src_rect.bottom > blit.src_rect.top;
@@ -430,8 +439,12 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
     // free: GXM context state already persists across scene boundaries, the source cannot be
     // what this scene renders into (overlap was refused above), and the destination is held
     // by the open scene's serial rather than one of its own.
+    // Not when the open scene renders into the source either: a depth source is a separate
+    // allocation from the colour target, so the overlap test above does not see it.
     const bool merged = in_scene && scene_fb != nullptr && scene_fb->color_id &&
-                        &res_cache.GetSurface(scene_fb->color_id) == &dest;
+                        &res_cache.GetSurface(scene_fb->color_id) == &dest &&
+                        !(scene_fb->depth_id &&
+                          &res_cache.GetSurface(scene_fb->depth_id) == &source);
     SceGxmRenderTarget* target = nullptr;
     if (!merged) {
         target = BlitTargetFor(dest.width, dest.height);
@@ -557,7 +570,6 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
             SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0, 0);
     }
 
-    SceGxmTexture bound = *source.Texture();
     // Point sampling, so a same-size conversion is exact; the CPU path this replaces was
     // nearest too, and a filtered result would not match what the guest expects of a
     // display transfer.
@@ -908,29 +920,30 @@ bool RasterizerGxm::ReserveLutRows(LutTexture& lut, u32 needed) {
     if (needed == 0) {
         return false;
     }
-    bool wrapped = false;
-    if (lut.row_cursor + needed > lut.rows) {
-        lut.row_cursor = 0;
-        wrapped = true;
-    }
     const u32 half_rows = lut.rows / 2;
-    const u32 last_half = std::min((lut.row_cursor + needed - 1) / half_rows, 1u);
-    if (last_half != lut.half) {
-        // The rows of the half being left were handed to programs of the scene that is open
-        // (or about to open, when the upload comes before its BeginScene): nothing later
-        // samples them. The half being entered was left that way a ring-half ago.
-        lut.left_serial[lut.half] = runtime.CurrentEpoch() + 1;
-        lut.half = last_half;
-        const u64 wanted = lut.left_serial[last_half];
-        if (wanted != 0 && runtime.CompletedEpoch() < wanted) {
-            if (in_scene) {
-                EndScene();
-            }
-            runtime.WaitForEpoch(wanted);
-            stat_lut_waits++;
-        }
+    ASSERT_MSG(needed <= half_rows, "{} LUT rows asked of a {}-row half", needed, half_rows);
+    if (lut.row_cursor + needed <= (lut.half + 1) * half_rows) {
+        return false;
     }
-    return wrapped;
+    // A half is only ever left whole, and the caller re-uploads every LUT into the half being
+    // entered. Otherwise a LUT that was not dirty keeps its row in the half being left, draws
+    // after this point still sample it, left_serial understates its last use, and the next
+    // re-entry overwrites rows that queued scenes have not shaded yet: Pokemon X/Y's lighting
+    // drew tile-shaped speckles that way (console, 2026-11-17).
+    // The rows of the half being left are sampled by the scene that is open at most (or about
+    // to open, when the upload comes before its BeginScene).
+    lut.left_serial[lut.half] = runtime.CurrentEpoch() + 1;
+    lut.half ^= 1;
+    lut.row_cursor = lut.half * half_rows;
+    const u64 wanted = lut.left_serial[lut.half];
+    if (wanted != 0 && runtime.CompletedEpoch() < wanted) {
+        if (in_scene) {
+            EndScene();
+        }
+        runtime.WaitForEpoch(wanted);
+        stat_lut_waits++;
+    }
+    return true;
 }
 
 void RasterizerGxm::SyncAndUploadLUTs() {
@@ -938,13 +951,12 @@ void RasterizerGxm::SyncAndUploadLUTs() {
         return;
     }
     using namespace Pica::Shader;
-    // Row allocation is round-robin, as in the GL backend's 2D path: a wrap hands out rows
-    // whose offsets other, non-dirty LUTs still point at, so a wrap restarts the ring and
-    // re-uploads every LUT of that texture. The ring is recycled in halves (ReserveLutRows),
-    // so no row is rewritten while a scene may still sample it and, with 512 rows against
-    // the two dozen a lighting change dirties, the wait for the half's last scene is over
-    // before it starts. The full GPU drain a wrap used to do came once every two frames on
-    // SM3DL's title scene (128 rows), and broke the scene it landed in.
+    // Row allocation is round-robin within a half of the ring. Moving to the other half
+    // (ReserveLutRows) re-uploads every LUT of that texture there, so nothing samples the half
+    // left behind and no row is rewritten while a scene may still sample it; with 512 rows
+    // against the two dozen a lighting change dirties, the wait for the half's last scene is
+    // over before it starts. The full GPU drain a wrap used to do came once every two frames
+    // on SM3DL's title scene (128 rows), and broke the scene it landed in.
     const u32 lf_needed = static_cast<u32>(std::popcount(pica.lighting.lut_dirty)) +
                           (pica.fog.lut_dirty ? 1u : 0u);
     const u32 rg_needed = (pica.proctex.noise_lut_dirty ? 1u : 0u) +
@@ -955,14 +967,13 @@ void RasterizerGxm::SyncAndUploadLUTs() {
     if (ReserveLutRows(lut_lf, lf_needed)) {
         pica.lighting.lut_dirty = pica.lighting.LutAllDirty;
         pica.fog.lut_dirty = true;
-        // The wrap needs every row again.
+        // The new half needs every row again; it starts empty, so they fit.
         ReserveLutRows(lut_lf, static_cast<u32>(std::popcount(pica.lighting.lut_dirty)) + 1);
     }
     const bool rg_wrapped = ReserveLutRows(lut_rg, rg_needed);
     const bool rgba_wrapped = ReserveLutRows(lut_rgba, rgba_needed);
     if (rg_wrapped || rgba_wrapped) {
-        lut_rg.row_cursor = 0;
-        lut_rgba.row_cursor = 0;
+        // Every proctex table again, in whichever half each texture is now handing out.
         pica.proctex.table_dirty = pica.proctex.TableAllDirty;
         ReserveLutRows(lut_rg, 3);
         ReserveLutRows(lut_rgba, 2);
@@ -1896,6 +1907,16 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         const PhaseTimer timer{time_draws, times.textures};
         SyncAndUploadLUTs();
         SyncTextureUnits(fb);
+    }
+    // Bring-up switch skipdepthfx: drop draws that sample a depth buffer read back as colour
+    // (Pokemon X/Y's screen-space passes), to tell whether a wrong picture comes from them.
+    static const bool skip_depth_fx = GxmFlag("skipdepthfx");
+    if (skip_depth_fx) {
+        for (const VideoCore::SurfaceId id : bound_surfaces) {
+            if (id && res_cache.GetSurface(id).from_depth) {
+                return false;
+            }
+        }
     }
     {
         const PhaseTimer timer{time_draws, times.scene};
